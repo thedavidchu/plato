@@ -1,0 +1,7 @@
+hydra-core
+torch
+torchvision
+numpy
+matplotlib
+scipy
+lpips
