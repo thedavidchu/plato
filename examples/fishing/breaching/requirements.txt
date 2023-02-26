@@ -5,3 +5,13 @@ numpy
 matplotlib
 scipy
 lpips
+python-socketio
+aiohttp
+boto3
+datasets
+transformers
+opacus
+gym
+zstd
+torch-optimizer
+timm

@@ -63,9 +63,9 @@ user.plot(fished_data)
 
 ####
 
-metrics = breaching.analysis.report(reconstructed_user_data, true_user_data, [server_payload], 
-                                    server.model, order_batch=True, compute_full_iip=False, 
-                                    cfg_case=cfg.case, setup=setup)
+# metrics = breaching.analysis.report(reconstructed_user_data, true_user_data, [server_payload],
+#                                     server.model, order_batch=True, compute_full_iip=False,
+#                                     cfg_case=cfg.case, setup=setup)
 
 ####
 

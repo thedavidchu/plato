@@ -276,8 +276,8 @@ class UserSingleStep(torch.nn.Module):  # NOTE(dchu): FISHING
             # print(f'min_val: {min_val} | max_val: {max_val}')
             data = (data - min_val) / (max_val - min_val)
         else:
-            data.mul_(ds).add_(dm).clamp_(0, 1)
-        data = data.to(dtype=torch.float32)
+            data.reshape((-1, 3, 224, 224)).mul_(ds).add_(dm).clamp_(0, 1)
+        data = data.to(dtype=torch.float32).reshape((-1, 3, 224, 224))
 
         if data.shape[0] == 1:
             plt.axis("off")
