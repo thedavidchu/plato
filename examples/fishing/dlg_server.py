@@ -20,6 +20,7 @@ https://proceedings.neurips.cc/paper/2020/file/c4ede56bbd98819ae6112b20ac6bf145-
 import asyncio
 import logging
 import math
+import numbers
 import os
 import shutil
 from collections import OrderedDict
@@ -58,6 +59,13 @@ dlg_result_headers = [
     "Average SSIM",
     "Average Library SSIM",
 ]
+
+
+def wrap_indices(indices):
+    if isinstance(indices, numbers.Number):
+        return [indices]
+    else:
+        return list(indices)
 
 
 class Server(fedavg.Server):
@@ -108,13 +116,46 @@ class Server(fedavg.Server):
         # Save trail 1 as the best as default when results are all bad
         self.best_trial = 1
 
+    def choose_clients(self, client_pool, clients_count):
+        """Choose a single client to query for the fishing optimization attack
+        (since selecting multiple would be wasteful of compute."""
+        if Config().algorithm.attack_method != "fishing":
+            return super().choose_clients(client_pool, clients_count)
+        # Arbitrarily select the client with the minimum id in the client_pool,
+        # which would ideally be the same client each time. This also implicitly
+        # ignores the clients_count parameter.
+        return [min(client_pool)]
+
+    @torch.no_grad()
+    def customize_server_payload(self, payload):
+        cls_to_obtain = Config().server.cls_to_obtain
+        feature_loc = Config().server.feature_loc
+        feature_val = Config().server.feature_val
+        bias_multiplier = Config().server.bias_multiplier
+        feat_multiplier = Config().server.feat_multiplier
+
+        # TODO(dchu) do the model parameters actually change?
+        *_, l_w, l_b = self.model.parameters()
+
+        masked_weight = torch.zeros_like(l_w)
+        masked_weight[cls_to_obtain, feature_loc] = feat_multiplier
+        l_w.copy_(masked_weight)
+
+        masked_bias = torch.ones_like(l_b) * bias_multiplier
+        masked_bias[
+            cls_to_obtain] = -feature_val * feat_multiplier
+        l_b.copy_(masked_bias)
+
+        # Re-extract the payload from the self.model.parameters()
+        return self.algorithm.extract_weights()
+
     def weights_received(self, weights_received):
         """
         Perform attack in attack around after the updated weights have been aggregated.
         """
         if (
             self.current_round == Config().algorithm.attack_round
-            and Config().algorithm.attack_method in ["DLG", "iDLG", "csDLG"]
+            and Config().algorithm.attack_method in ["DLG", "iDLG", "csDLG", "fishing"]
         ):
             self.attack_method = Config().algorithm.attack_method
             self._deep_leakage_from_gradients(weights_received)
