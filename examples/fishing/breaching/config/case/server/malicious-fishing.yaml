@@ -1,3 +1,4 @@
+# TODO(dchu) used in fishing attack
 name: class_malicious_parameters
 pretrained: True
 model_state: unchanged # Disregard updates here

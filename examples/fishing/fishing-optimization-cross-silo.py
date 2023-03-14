@@ -40,6 +40,8 @@ cfg.case.server.target_cls_idx = 0 # Which class to attack?
 
 user, server, model, loss_fn = breaching.cases.construct_case(cfg.case, setup)
 attacker = breaching.attacks.prepare_attack(server.model, server.loss, cfg.attack, setup)
+
+# Print the server, user, and attacker
 breaching.utils.overview(server, user, attacker)
 
 ####
