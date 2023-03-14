@@ -128,6 +128,8 @@ class HonestServer:   # NOTE(dchu): FISHING
         self.reconfigure_model(self.cfg_server.model_state, query_id)
         honest_model_parameters = [p for p in self.model.parameters()]  # do not send only the generators
         if self.cfg_server.provide_public_buffers:
+            # NOTE(dchu): buffers are tensors that don't need to store gradient
+            # information (e.g. batch norm avg and stddev)
             honest_model_buffers = [b for b in self.model.buffers()]
         else:
             honest_model_buffers = None
@@ -368,148 +370,6 @@ class MaliciousModelServer(HonestServer):
         return modified_model, decoder
 
 
-# class MaliciousTransformerServer(HonestServer):
-#     """Implement a malicious server protocol.
-#
-#     This server cannot modify the 'honest' model architecture posed by an analyst,
-#     but may modify the model parameters freely.
-#     This variation is designed to leak token information from transformer models for language modelling.
-#     """
-#
-#     THREAT = "Malicious (Parameters)"
-#
-#     def __init__(
-#         self, model, loss, cfg_case, setup=dict(dtype=torch.float, device=torch.device("cpu")), external_dataloader=None
-#     ):
-#         """Inialize the server settings."""
-#         super().__init__(model, loss, cfg_case, setup, external_dataloader)
-#         self.secrets = dict()
-#
-#     def vet_model(self, model):
-#         """This server is not honest, but the model architecture stays unchanged."""
-#         model = self.model  # Re-reference this everywhere
-#         return self.model
-#
-#     def reconfigure_model(self, model_state, query_id=0):
-#         """Reinitialize, continue training or otherwise modify model parameters."""
-#         super().reconfigure_model(model_state)  # Load the benign model state first
-#
-#         # Figure out the names of all layers by lookup:
-#         # For now this is non-automated. Add a new arch to this lookup function before running it.
-#         lookup = lookup_module_names(self.model.name, self.model)
-#         hidden_dim, embedding_dim, ff_transposed = lookup["dimensions"]
-#         num_transformer_layers = len(lookup["first_linear_layers"])
-#
-#         # Define "probe" function / measurement vector:
-#         # Probe Length is embedding_dim minus v_proportion minus skip node
-#         measurements = []
-#         for layer in range(num_transformer_layers):
-#             measurement_scale = self.cfg_server.param_modification.measurement_scale
-#             v_length = self.cfg_server.param_modification.v_length
-#             probe_dim = embedding_dim - v_length - 1
-#             weights = torch.randn(probe_dim, **self.setup)
-#             std, mu = torch.std_mean(weights)  # correct sample toward perfect mean and std
-#             probe = (weights - mu) / std / torch.as_tensor(probe_dim, **self.setup).sqrt() * measurement_scale
-#
-#             measurement = torch.zeros(embedding_dim, **self.setup)
-#             measurement[v_length:-1] = probe
-#             measurements.append(measurement)
-#
-#         # Reset the embedding?:
-#         if self.cfg_server.param_modification.reset_embedding:
-#             lookup["embedding"].reset_parameters()
-#         # Disable these parts of the embedding:
-#         partially_disable_embedding(lookup["embedding"], v_length)
-#         if hasattr(lookup["pos_encoder"], "embedding"):
-#             partially_disable_embedding(lookup["pos_encoder"].embedding, v_length)
-#             partially_norm_position(lookup["pos_encoder"].embedding, v_length)
-#
-#             # Maybe later:
-#             # self.model.pos_encoder.embedding.weight.data[:, v_length : v_length * 4] = 0
-#             # embedding.weight.data[:, v_length * 4 :] = 0
-#
-#         # with torch.no_grad():
-#         #     lookup["norm_layer1"].bias += 100
-#         #     lookup["norm_layer1"].weight *= 1
-#         # Modify the first attention mechanism in the model:
-#         # Set QKV modifications in-place:
-#         set_MHA(
-#             lookup["first_attention"],
-#             lookup["norm_layer0"],
-#             lookup["pos_encoder"],
-#             embedding_dim,
-#             ff_transposed,
-#             self.cfg_data.shape,
-#             sequence_token_weight=self.cfg_server.param_modification.sequence_token_weight,
-#             imprint_sentence_position=self.cfg_server.param_modification.imprint_sentence_position,
-#             softmax_skew=self.cfg_server.param_modification.softmax_skew,
-#             v_length=v_length,
-#         )
-#
-#         # Take care of second linear layers, and unused mha layers first
-#         set_flow_backward_layer(
-#             lookup["second_linear_layers"], ff_transposed=ff_transposed, eps=self.cfg_server.param_modification.eps
-#         )
-#         disable_mha_layers(lookup["unused_mha_outs"])
-#
-#         if self.cfg_data.task == "masked-lm" and not self.cfg_data.disable_mlm:
-#             equalize_mha_layer(
-#                 lookup["last_attention"],
-#                 ff_transposed,
-#                 equalize_token_weight=self.cfg_server.param_modification.equalize_token_weight,
-#                 v_length=v_length,
-#             )
-#         else:
-#             if lookup["last_attention"]["mode"] == "bert":
-#                 lookup["last_attention"]["output"].weight.data.zero_()
-#                 lookup["last_attention"]["output"].bias.data.zero_()
-#             else:
-#                 lookup["last_attention"]["out_proj_weight"].data.zero_()
-#                 lookup["last_attention"]["out_proj_bias"].data.zero_()
-#
-#         # Evaluate feature distribution of this model
-#         if self.cfg_server.param_modification.bin_setup == "concatenate":
-#             std, mu = compute_feature_distribution(self.model, lookup["first_linear_layers"][0], measurements[0], self)
-#             # And add imprint modification to the first linear layer
-#             make_imprint_layer(
-#                 lookup["first_linear_layers"], measurements[0], mu, std, hidden_dim, embedding_dim, ff_transposed
-#             )
-#         elif self.cfg_server.param_modification.bin_setup == "separate":
-#             for idx, linear_layer in enumerate(lookup["first_linear_layers"]):
-#                 std, mu = compute_feature_distribution(self.model, linear_layer, measurements[idx], self)
-#                 # And add imprint modification to the first linear layer
-#                 make_imprint_layer([linear_layer], measurements[idx], mu, std, hidden_dim, embedding_dim, ff_transposed)
-#         elif self.cfg_server.param_modification.bin_setup == "repeat":
-#             for idx, linear_layer in enumerate(lookup["first_linear_layers"]):
-#                 std, mu = compute_feature_distribution(self.model, linear_layer, measurements[0], self)
-#                 # And add imprint modification to the first linear layer
-#                 make_imprint_layer([linear_layer], measurements[0], mu, std, hidden_dim, embedding_dim, ff_transposed)
-#         else:
-#             raise ValueError(f"Invalid bin setup {self.cfg_server.param_modification.bin_setup} given.")
-#
-#         # We save secrets for the attack later on:
-#         num_layers = len(lookup["first_linear_layers"])
-#         tracker = 0
-#         weight_idx, bias_idx = [], []
-#         for idx, param in enumerate(self.model.parameters()):
-#             if tracker < num_layers and param is lookup["first_linear_layers"][tracker].weight:
-#                 weight_idx.append(idx)
-#             if tracker < num_layers and param is lookup["first_linear_layers"][tracker].bias:
-#                 bias_idx.append(idx)
-#                 tracker += 1
-#
-#         details = dict(
-#             weight_idx=weight_idx,
-#             bias_idx=bias_idx,
-#             data_shape=self.cfg_data.shape,
-#             structure="cumulative",
-#             v_length=v_length,
-#             ff_transposed=ff_transposed,
-#             bin_setup=self.cfg_server.param_modification.bin_setup,
-#         )
-#         self.secrets["ImprintBlock"] = details
-#
-
 class MaliciousClassParameterServer(HonestServer):   # NOTE(dchu): FISHING
     """Modify parameters for the "class attack" which can pick out a subset of image data from a larger batch."""
 
@@ -532,23 +392,25 @@ class MaliciousClassParameterServer(HonestServer):   # NOTE(dchu): FISHING
         model = self.model  # Re-reference this everywhere
         return self.model
 
+    # TODO(dchu) this is the method to reconstruct!
     def run_protocol(self, user, additional_users=None, run_honest_protocol=False):
         """This server is allowed to run malicious protocols."""
         if run_honest_protocol:
             return super().run_protocol(user)
         else:
             if additional_users is None:
-                return self.run_protocol_binary_attack(user)
+                return self.run_protocol_binary_attack(user) # This is what is run
             else:
                 return self.run_protocol_feature_estimation(user, additional_users)
 
+    # TODO(dchu) this is the method to reconstruct!
     def run_protocol_binary_attack(self, user):
         """Helper function for modified protocols, this is a binary attack that will repeatedly query a user
         with malicious server states."""
         # get class info first (this could be skipped and replaced by an attack on all/random labels)
         server_payload = self.distribute_payload()
 
-        if self.cfg_server.query_once_for_labels:
+        if self.cfg_server.query_once_for_labels:   # NOTE(dchu): branch taken
             shared_data, true_user_data = user.compute_local_updates(server_payload)
             # This first query is not strictly necessary, you could also attack for a random class.
             t_labels = shared_data["metadata"]["labels"].detach().cpu().numpy()
@@ -565,11 +427,12 @@ class MaliciousClassParameterServer(HonestServer):   # NOTE(dchu): FISHING
 
             # cls attack on all labels in the batch
             self.reconfigure_for_class_attack(target_classes=t_labels)
-            server_payload = server.distribute_payload()
+            # NOTE(dchu): is this 'server' a reference to self?
+            server_payload = self.distribute_payload()
             shared_data, true_user_data = user.compute_local_updates(server_payload)
             final_shared_data = [shared_data]
             final_payload = [server_payload]
-        else:
+        else:   # NOTE(dchu): branch taken
             # attack cls by cls
             target_cls = np.unique(t_labels)[self.cfg_server.target_cls_idx]  # Could be any class
             target_indx = np.where(t_labels == target_cls)[0]
@@ -583,6 +446,7 @@ class MaliciousClassParameterServer(HonestServer):   # NOTE(dchu): FISHING
                 cls_to_obtain = int(reduced_shared_data["metadata"]["labels"][0])
 
                 # modify the parameters first
+                # NOTE(dchu): this is where the parameter modification happens!!!
                 self.reconfigure_for_class_attack(target_classes=cls_to_obtain)
 
                 server_payload = self.distribute_payload()
@@ -623,7 +487,7 @@ class MaliciousClassParameterServer(HonestServer):   # NOTE(dchu): FISHING
                     )
                     attack_state["num_data_points"] = shared_data["metadata"]["num_data_points"]
 
-                    if self.cfg_server.one_shot_binary_attack:
+                    if self.cfg_server.one_shot_binary_attack:  # NOTE(dchu): branch taken
                         recovered_single_gradients = self.one_shot_binary_attack(user, cls_to_obtain, attack_state)
                     else:
                         recovered_single_gradients = self.binary_attack(user, cls_to_obtain, attack_state)
@@ -700,6 +564,7 @@ class MaliciousClassParameterServer(HonestServer):   # NOTE(dchu): FISHING
 
         return [shared_data], [server_payload], true_user_data
 
+    # TODO(dchu): this is the function for the attack
     def one_shot_binary_attack(self, user, cls_to_obtain, attack_state):
         feature_loc = attack_state["feature_loc"]
         feature_val = attack_state["feature_val"]
@@ -856,6 +721,7 @@ class MaliciousClassParameterServer(HonestServer):   # NOTE(dchu): FISHING
         masked_bias[cls_to_obtain] = l_b[cls_to_obtain]
         l_b.copy_(masked_bias)
 
+    # TODO(dchu): this is the model to reconfigure feature attack
     @torch.no_grad()
     def reconfigure_for_feature_attack(
         self, feature_val, feature_loc, target_classes=None, allow_reset_param_weights=False
@@ -869,8 +735,8 @@ class MaliciousClassParameterServer(HonestServer):   # NOTE(dchu): FISHING
         if allow_reset_param_weights and self.cfg_server.reset_param_weights:
             feat_multiplier = 1
         else:
-            feat_multiplier = self.cfg_server.feat_multiplier
-
+            feat_multiplier = self.cfg_server.feat_multiplier   # NOTE(dchu): 300
+        # TODO(dchu): verify that the model is actually changed here!
         *_, l_w, l_b = self.model.parameters()
 
         masked_weight = torch.zeros_like(l_w)
