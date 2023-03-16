@@ -128,22 +128,24 @@ class Server(fedavg.Server):
 
     @torch.no_grad()
     def customize_server_payload(self, payload):
-        cls_to_obtain = Config().server.cls_to_obtain
-        feature_loc = Config().server.feature_loc
-        feature_val = Config().server.feature_val
-        bias_multiplier = Config().server.bias_multiplier
-        feat_multiplier = Config().server.feat_multiplier
+        """Taken from breaching/cases/servers.py:reconfigure_for_class_attack"""
+        target_cls_idx = Config().server.target_cls_idx     # 0
+        class_multiplier = Config().server.class_multiplier     # 0.5
+        bias_multiplier = Config().server.bias_multiplier   # 1000
 
-        # TODO(dchu) do the model parameters actually change?
-        *_, l_w, l_b = self.model.parameters()
+        target_classes = [target_cls_idx]
+        cls_to_obtain = wrap_indices(target_classes)
 
+        *_, l_w, l_b = self.algorithm.model.fc.parameters()
+
+        # linear weight
         masked_weight = torch.zeros_like(l_w)
-        masked_weight[cls_to_obtain, feature_loc] = feat_multiplier
+        masked_weight[cls_to_obtain] = class_multiplier
         l_w.copy_(masked_weight)
 
+        # linear bias
         masked_bias = torch.ones_like(l_b) * bias_multiplier
-        masked_bias[
-            cls_to_obtain] = -feature_val * feat_multiplier
+        masked_bias[cls_to_obtain] = l_b[cls_to_obtain]
         l_b.copy_(masked_bias)
 
         # Re-extract the payload from the self.model.parameters()
@@ -348,6 +350,22 @@ class Server(fedavg.Server):
                     self.defense_method,
                     torch.argmax(gt_labels[i], dim=-1).item(),
                 )
+        elif self.attack_method == "fishing":
+            match_optimizer = torch.optim.LBFGS(
+                [
+                    dummy_data,
+                ],
+                lr=Config().algorithm.lr,
+            )
+            labels_ = gt_labels
+            for i in range(num_images):
+                logging.info(
+                    "[%s Gradient Leakage Attack %d with %s defense...] Known label is %d.",
+                    self.attack_method,
+                    trial_number,
+                    self.defense_method,
+                    torch.argmax(gt_labels[i], dim=-1).item(),
+                )
 
         history, losses, mses, lpipss, psnrs, ssims, library_ssims = (
             [],
@@ -467,6 +485,19 @@ class Server(fedavg.Server):
                             for i in range(num_images)
                         ]
                     )
+                elif self.attack_method == "fishing":
+                    history.append(
+                        [
+                            [
+                                dummy_data[i].cpu().permute(
+                                    1, 2, 0
+                                    ).detach().clone(),
+                                torch.argmax(gt_labels[i], dim=-1),
+                                dummy_data[i],
+                            ]
+                            for i in range(num_images)
+                        ]
+                    )
 
                 new_row = [
                     iters,
@@ -515,7 +546,7 @@ class Server(fedavg.Server):
             if self.attack_method == "DLG":
                 dummy_onehot_label = F.softmax(labels, dim=-1)
                 dummy_loss = cross_entropy_for_onehot(dummy_pred, dummy_onehot_label)
-            elif self.attack_method in ["iDLG", "csDLG"]:
+            elif self.attack_method in ["iDLG", "csDLG", "fishing"]:
                 dummy_loss = cross_entropy(dummy_pred, labels)
 
             dummy_grad = torch.autograd.grad(
