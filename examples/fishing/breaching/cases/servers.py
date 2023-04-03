@@ -721,7 +721,6 @@ class MaliciousClassParameterServer(HonestServer):   # NOTE(dchu): FISHING
         masked_bias[cls_to_obtain] = l_b[cls_to_obtain]
         l_b.copy_(masked_bias)
 
-    # TODO(dchu): this is the model to reconfigure feature attack
     @torch.no_grad()
     def reconfigure_for_feature_attack(
         self, feature_val, feature_loc, target_classes=None, allow_reset_param_weights=False
