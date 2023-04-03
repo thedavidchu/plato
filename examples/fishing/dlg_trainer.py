@@ -102,7 +102,7 @@ class Trainer(basic.Trainer):
         ):
             self.list_grad = []
             for example, label in zip(examples, labels):
-                outputs, _ = self.model(torch.unsqueeze(example, dim=0))
+                outputs = self.model(torch.unsqueeze(example, dim=0))
 
                 loss = self._loss_criterion(outputs, torch.unsqueeze(label, dim=0))
                 grad = torch.autograd.grad(
@@ -114,7 +114,7 @@ class Trainer(basic.Trainer):
                 )
                 self.list_grad.append(list((_.detach().clone() for _ in grad)))
         else:
-            outputs, self.feature_fc1_graph = self.model(examples)
+            outputs = self.model(examples)
 
             # Save the ground truth and gradients
             loss = self._loss_criterion(outputs, labels)

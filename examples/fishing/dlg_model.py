@@ -33,6 +33,5 @@ class Model(nn.Module):
     def forward(self, x):
         out = self.body(x)
         feature = out.view(out.size(0), -1)
-        # print(out.size())
         out = self.fc(feature)
-        return out, feature
+        return out
