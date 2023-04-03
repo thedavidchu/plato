@@ -23,7 +23,8 @@ import math
 import numbers
 import os
 import shutil
-from collections import OrderedDict
+import time
+from collections import OrderedDict, defaultdict
 from copy import deepcopy
 
 import matplotlib.gridspec as gridspec
@@ -157,10 +158,52 @@ class Server(fedavg.Server):
         """
         if (
             self.current_round == Config().algorithm.attack_round
-            and Config().algorithm.attack_method in ["DLG", "iDLG", "csDLG", "fishing"]
+            and Config().algorithm.attack_method in ["DLG", "iDLG", "csDLG"]
         ):
             self.attack_method = Config().algorithm.attack_method
             self._deep_leakage_from_gradients(weights_received)
+        elif (
+            self.current_round == Config().algorithm.attack_round
+            and Config().algorithm.attack_method == "fishing"
+        ):
+            self._setup_reconstruction()
+            baseline_weights = self.algorithm.extract_weights()
+            deltas_received = self.algorithm.compute_weight_deltas(
+                baseline_weights, weights_received
+            )
+            report = self.updates[Config().algorithm.victim_client].report
+            gt_labels = report.gt_labels
+            self.reconstruct(
+                server_payload=[
+                    dict(
+                        parameters=list(baseline_weights.values()),
+                        buffers=None,
+                        metadata=None,
+                    )
+                ],
+                shared_data=[
+                    dict(
+                        gradients=list(deltas_received[0].values()),
+                        buffers=None,
+                        metadata=dict(
+                            num_data_points=1,
+                            labels=torch.Tensor([0]).long(),
+                            num_users=1,
+                            local_hyperparams=None,
+                        ),
+                    )
+                ],
+                server_secrets=dict(
+                    ClassAttack=dict(
+                        num_data=1,
+                        target_indx=[0],
+                        true_num_data=256,
+                        all_labels=gt_labels,
+                    )
+                ),
+                initial_data=None,
+                dryrun=False,
+            )
 
         return weights_received
 
@@ -310,7 +353,6 @@ class Server(fedavg.Server):
                     self.defense_method,
                     torch.argmax(dummy_labels[i], dim=-1).item(),
                 )
-
         elif self.attack_method == "iDLG":
             match_optimizer = torch.optim.LBFGS(
                 [
@@ -486,6 +528,7 @@ class Server(fedavg.Server):
                         ]
                     )
                 elif self.attack_method == "fishing":
+                    # TODO(dchu) make sure you call this - this is how you
                     history.append(
                         [
                             [
@@ -753,3 +796,319 @@ class Server(fedavg.Server):
                 innerplot.axis("off")
                 fig.add_subplot(innerplot)
         fig.savefig(reconstructed_result_path)
+
+    ############################################################################
+    # BREACHING CODE
+    ############################################################################
+
+    # TODO(dchu) call this method!
+    def _setup_reconstruction(self):
+        self.setup = dict(device=torch.device("cpu"), dtype=torch.float)
+        self.memory_format = torch.contiguous_format
+
+        # CIFAR-10's data shape
+        self.data_shape = (3, 32, 32)
+
+        from auxiliaries.objectives import CosineSimilarity
+
+        self.objective = CosineSimilarity(scale=1.0, task_regularization=0.0)
+
+        from auxiliaries.regularizers import TotalVariation
+
+        self.regularizers = [TotalVariation(
+            self.setup, **dict(scale=0.2, inner_exp=2, outer_exp=0.5, double_opponents=True)
+        )]
+
+        self.augmentations = torch.nn.Sequential()  # No augmentations selected.
+
+        # From model_preparation.py
+        loss_fn = torch.nn.CrossEntropyLoss()
+        self.loss_fn = torch.jit.script(loss_fn)
+
+        # Load preprocessing constants:
+        # PyTorch hard-codes the mean and std
+        self.dm = torch.as_tensor([0.485, 0.456, 0.406], **self.setup)[None, :,
+        None, None]
+        self.ds = torch.as_tensor([0.229, 0.224, 0.225], **self.setup)[None, :,
+        None, None]
+
+    def _initialize_data(self, data_shape):
+        """Initialize data as randn"""
+        candidate = torch.randn(data_shape, **self.setup)
+        candidate.to(memory_format=torch.contiguous_format)
+        candidate.requires_grad = True
+        candidate.grad = torch.zeros_like(candidate)
+        return candidate
+
+    def _construct_models_from_payload_and_buffers(
+        self, server_payload, shared_data
+    ):
+        """Construct the model (or multiple) that is sent by the server and include user buffers if any."""
+
+        # Load states into multiple models if necessary
+        models = []
+        for idx, payload in enumerate(server_payload):
+            new_model = deepcopy(self.algorithm.model)
+            new_model.to(**self.setup, memory_format=self.memory_format)
+
+            # Load parameters
+            parameters = payload["parameters"]
+            if shared_data[idx]["buffers"] is not None:
+                # User sends buffers. These should be used!
+                buffers = shared_data[idx]["buffers"]
+                new_model.eval()
+            elif payload["buffers"] is not None:
+                # The server has public buffers in any case
+                buffers = payload["buffers"]
+                new_model.eval()
+            else:
+                # The user sends no buffers and there are no public bufers
+                # (i.e. the user in in training mode and does not send updates)
+                new_model.train()
+                for module in new_model.modules():
+                    if hasattr(module, "track_running_stats"):
+                        module.reset_parameters()
+                        module.track_running_stats = False
+                buffers = []
+
+            with torch.no_grad():
+                for param, server_state in zip(new_model.parameters(), parameters):
+                    param.copy_(server_state.to(**self.setup))
+                for buffer, server_state in zip(new_model.buffers(), buffers):
+                    buffer.copy_(server_state.to(**self.setup))
+            models.append(new_model)
+        return models
+
+    def _cast_shared_data(self, shared_data):
+        """Cast user data to reconstruction data type."""
+        # for data["gradients"]:
+        for data in shared_data:
+            data["gradients"] = [g.to(dtype=self.setup["dtype"]) for g in data["gradients"]]
+            if data["buffers"] is not None:
+                data["buffers"] = [b.to(dtype=self.setup["dtype"]) for b in data["buffers"]]
+        return shared_data
+
+    def _recover_label_information(self, user_data, server_payload, rec_models):
+        """Recover label information.
+
+        This method runs under the assumption that the last two entries in the gradient vector
+        correpond to the weight and bias of the last layer (mapping to num_classes).
+        For non-classification tasks this has to be modified.
+
+        The behavior with respect to multiple queries is work in progress and subject of debate.
+        """
+        num_data_points = user_data[0]["metadata"]["num_data_points"]
+        num_classes = user_data[0]["gradients"][-1].shape[0]
+        num_queries = len(user_data)
+
+        # NOTE: label strategy is "bias-corrected"
+        # This is slightly modified analytic label recovery in the style of Wainakh
+        bias_per_query = [shared_data["gradients"][-1] for shared_data in user_data]
+        label_list = []
+        # Stage 1
+        average_bias = torch.stack(bias_per_query).mean(dim=0)
+        valid_classes = (average_bias < 0).nonzero()
+        label_list += [*valid_classes.squeeze(dim=-1)]
+        m_impact = average_bias_correct_label = average_bias[valid_classes].sum() / num_data_points
+
+        average_bias[valid_classes] = average_bias[valid_classes] - m_impact
+        # Stage 2
+        while len(label_list) < num_data_points:
+            selected_idx = average_bias.argmin()
+            label_list.append(selected_idx)
+            average_bias[selected_idx] -= m_impact
+        labels = torch.stack(label_list)
+
+        # Pad with random labels if too few were produced:
+        if len(labels) < num_data_points:
+            labels = torch.cat(
+                [labels, torch.randint(0, num_classes, (num_data_points - len(labels),), device=self.setup["device"])]
+            )
+
+        # Always sort, order does not matter here:
+        labels = labels.sort()[0]
+        print(f"Recovered labels {labels.tolist()} through strategy 'bias-corrected'.")
+        return labels
+
+    def prepare_attack(self, server_payload, shared_data):
+        """Basic startup common to many reconstruction methods."""
+        stats = defaultdict(list)
+
+        shared_data = shared_data.copy()  # Shallow copy is enough
+        server_payload = server_payload.copy()
+
+        # Load server_payload into state:
+        rec_models = self._construct_models_from_payload_and_buffers(
+            server_payload, shared_data
+            )
+        shared_data = self._cast_shared_data(shared_data)
+        self._rec_models = rec_models   # TODO(dchu) remove this unused code
+        # Consider label information
+        if shared_data[0]["metadata"]["labels"] is None:
+            labels = self._recover_label_information(
+                shared_data, server_payload, rec_models
+                )
+        else:
+            labels = shared_data[0]["metadata"]["labels"].clone()
+        return rec_models, labels, stats
+
+    def reconstruct(self, server_payload, shared_data, server_secrets=None, initial_data=None, dryrun=False):
+        # Initialize stats module for later usage:
+        rec_models, labels, stats = self.prepare_attack(server_payload, shared_data)
+        # Main reconstruction loop starts here:
+        scores = torch.zeros(Config().algorithm.num_trials)
+        candidate_solutions = []
+        try:
+            for trial in range(Config().algorithm.num_trials):
+                candidate_solutions += [
+                    self._run_trial(rec_models, shared_data, labels, stats, trial, initial_data, dryrun)
+                ]
+                scores[trial] = self._score_trial(candidate_solutions[trial], labels, rec_models, shared_data)
+        except KeyboardInterrupt:
+            print("Trial procedure manually interruped.")
+            pass
+        optimal_solution = self._select_optimal_reconstruction(candidate_solutions, scores, stats)
+        reconstructed_data = dict(data=optimal_solution, labels=labels)
+        if "ClassAttack" in server_secrets:
+            # Only a subset of images was actually reconstructed:
+            true_num_data = server_secrets["ClassAttack"]["true_num_data"]
+            reconstructed_data["data"] = torch.zeros([true_num_data, *self.data_shape], **self.setup)
+            reconstructed_data["data"][server_secrets["ClassAttack"]["target_indx"]] = optimal_solution
+            reconstructed_data["labels"] = server_secrets["ClassAttack"]["all_labels"]
+        return reconstructed_data, stats
+
+    def _init_optimizer(self, candidate):
+        from auxiliaries.common import optimizer_lookup
+
+        optimizer, scheduler = optimizer_lookup(
+            candidate,
+            Config().algorithm.optim.optimizer,
+            Config().algorithm.optim.step_size,
+            scheduler=Config().algorithm.optim.step_size_decay,
+            warmup=Config().algorithm.optim.warmup,
+            max_iterations=Config().algorithm.optim.max_iterations,
+        )
+        return optimizer, scheduler
+
+    def _run_trial(self, rec_model, shared_data, labels, stats, trial, initial_data=None, dryrun=False):
+        """Run a single reconstruction trial."""
+
+        # Initialize losses:
+        for regularizer in self.regularizers:
+            regularizer.initialize(rec_model, shared_data, labels)
+        self.objective.initialize(self.loss_fn, Config().algorithm.impl, shared_data[0]["metadata"]["local_hyperparams"])
+
+        # Initialize candidate reconstruction data
+        candidate = self._initialize_data([shared_data[0]["metadata"]["num_data_points"], *self.data_shape])
+        if initial_data is not None:
+            candidate.data = initial_data.data.clone().to(**self.setup)
+
+        best_candidate = candidate.detach().clone()
+        minimal_value_so_far = torch.as_tensor(float("inf"), **self.setup)
+
+        # Initialize optimizers
+        optimizer, scheduler = self._init_optimizer([candidate])
+        current_wallclock = time.time()
+        try:
+            for iteration in range(num_iters):
+                closure = self._compute_objective(candidate, labels, rec_model, optimizer, shared_data, iteration)
+                objective_value, task_loss = optimizer.step(closure), self.current_task_loss
+                scheduler.step()
+
+                with torch.no_grad():
+                    # Project into image space
+                    if Config().algorithm.boxed:
+                        candidate.data = torch.max(torch.min(candidate, (1 - self.dm) / self.ds), -self.dm / self.ds)
+                    if objective_value < minimal_value_so_far:
+                        minimal_value_so_far = objective_value.detach()
+                        best_candidate = candidate.detach().clone()
+
+                if iteration + 1 == Config().algorithm.optim.max_iterations or iteration % Config().algorithm.optim.callback == 0:
+                    timestamp = time.time()
+                    print(
+                        f"| It: {iteration + 1} | Rec. loss: {objective_value.item():2.4f} | "
+                        f" Task loss: {task_loss.item():2.4f} | T: {timestamp - current_wallclock:4.2f}s"
+                    )
+                    current_wallclock = timestamp
+
+                if not torch.isfinite(objective_value):
+                    print(f"Recovery loss is non-finite in iteration {iteration}. Cancelling reconstruction!")
+                    break
+
+                stats[f"Trial_{trial}_Val"].append(objective_value.item())
+
+                if dryrun:
+                    break
+        except KeyboardInterrupt:
+            print(f"Recovery interrupted manually in iteration {iteration}!")
+            pass
+
+        return best_candidate.detach()
+
+    def _compute_objective(self, candidate, labels, rec_model, optimizer, shared_data, iteration):
+        def closure():
+            optimizer.zero_grad()
+
+            candidate_augmented = candidate
+            candidate_augmented.data = self.augmentations(candidate.data)
+
+            total_objective = 0
+            total_task_loss = 0
+            for model, data in zip(rec_model, shared_data):
+                objective, task_loss = self.objective(model, data["gradients"], candidate_augmented, labels)
+                total_objective += objective
+                total_task_loss += task_loss
+            for regularizer in self.regularizers:
+                total_objective += regularizer(candidate_augmented)
+
+            if total_objective.requires_grad:
+                total_objective.backward(inputs=candidate, create_graph=False)
+            with torch.no_grad():
+                if Config().algorithm.optim.signed is not None:
+                    if Config().algorithm.optim.signed == "soft":
+                        scaling_factor = (
+                            1 - iteration / Config().algorithm.optim.max_iterations
+                        )  # just a simple linear rule for now
+                        candidate.grad.mul_(scaling_factor).tanh_().div_(scaling_factor)
+                    elif Config().algorithm.optim.signed == "hard":
+                        candidate.grad.sign_()
+                    else:
+                        pass
+
+            self.current_task_loss = total_task_loss  # Side-effect this because of L-BFGS closure limitations :<
+            return total_objective
+
+        return closure
+
+    def _score_trial(self, candidate, labels, rec_model, shared_data):
+        """Score candidate solutions based on some criterion."""
+
+        from auxiliaries.objectives import CosineSimilarity
+
+        objective = CosineSimilarity()
+        objective.initialize(
+            self.loss_fn, Config().algorithm.impl,
+            shared_data[0]["metadata"]["local_hyperparams"]
+        )
+        score = 0
+        for model, data in zip(rec_model, shared_data):
+            score += objective(model, data["gradients"], candidate, labels)[0]
+        return score if score.isfinite() else float("inf")
+
+    def _select_optimal_reconstruction(
+        self, candidate_solutions, scores, stats
+    ):
+        """Choose one of the candidate solutions based on their scores (for now).
+
+        More complicated combinations are possible in the future."""
+        optimal_val, optimal_index = torch.min(scores, dim=0)
+        optimal_solution = candidate_solutions[optimal_index]
+        stats["opt_value"] = optimal_val.item()
+        if optimal_val.isfinite():
+            print(
+                f"Optimal candidate solution with rec. loss {optimal_val.item():2.4f} selected."
+                )
+            return optimal_solution
+        else:
+            print("No valid reconstruction could be found.")
+            return torch.zeros_like(optimal_solution)

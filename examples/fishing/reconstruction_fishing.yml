@@ -21,6 +21,7 @@ server:
     target_cls_idx: 0
     class_multiplier: 0.5
     bias_multiplier: 1000
+    do_test: false
 
 data:
     # The training and testing dataset
@@ -46,7 +47,7 @@ trainer:
 
     # Number of epoches for local training in each communication round
     epochs: 1
-    batch_size: 1
+    batch_size: 100
     optimizer: SGD
 
     # The machine learning model
@@ -85,7 +86,7 @@ algorithm:
     # Matching weights (absolute) or weight updates (delta)
     use_updates: false
     # The number of times the attack will be attempted
-    trials: 5
+    trials: 1
 
     ## Defense related
     # Choose from GradDefense, Soteria, GC (model compression), DP (differential privacy), Outpost (ours)...
@@ -110,6 +111,27 @@ algorithm:
 
     # The random seed for dummy data and label
     random_seed: 2
+
+    ## Fishing attack related
+    boxed: True
+    num_trials: 1
+    optim:
+        optimizer: Adam
+        signed: "soft"
+        step_size: 0.1
+        max_iterations: 5_000
+        step_size_decay: cosine-decay
+        warmup: 50
+        # Unused?
+        langevin_noise: 0.0
+        grad_clip:
+        callback: 10
+
+    impl:
+        dtype: float
+        mixed_precision: False
+        JIT: # bembel with care
+
 
 parameters:
     optimizer:
